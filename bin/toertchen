@@ -1,0 +1,705 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Copyright:
+#  2010, 2011 Florian Ludwig <dino@phidev.org>
+#        2011 Julian Seeger
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+print """WARNING: This is a hack. PRE-ALPHA QUALITY.
+Its quick and dirty. Really.
+The goal of the törtchen project [0] is to clean up this mess.
+
+[0] http://code.google.com/p/toertchen
+
+"""
+__version__ = '0.0.2'
+
+import os, sys, shutil
+import re
+import math
+import hashlib
+from xml.etree import cElementTree as et
+import subprocess as sp
+import ConfigParser
+
+import genshi.template
+import cairo
+import pango
+import pangocairo
+
+try:
+    import _bibtex
+except:
+    _bibtex = False
+
+
+INKSCAPE_CMD = 'inkscape'
+PAGE_LABEL = re.compile('^[0-9]+[_]*')
+
+if '${installed}' != '$installed':
+    # developer mode
+    base = os.path.dirname(__file__) + '/../'
+    DATA_PATH = base + 'data' # TODO this depends on installation
+    sys.path.append(base)
+else:
+    DATA_PATH = '$data_path'
+
+
+class Color(pango.Color):
+    def to_cairo_rgb(self):
+        return (self.red / 65535.,
+                self.green / 65535.,
+                self.blue / 65535.)
+
+
+class BaseCairoBackend(object):
+    def __init__(self, path, width, height):
+        self.path = path
+        self.width = width
+        self.height = height
+
+    def get_surface(self):
+        return self.surface
+
+
+class PNGBackend(BaseCairoBackend):
+    def __init__(self, path, width, height):
+        super(PNGBackend, self).__init__(path, width, height)
+        self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        self.i = 0
+
+    def turn_page(self, content=None, cr=None):
+        self.surface.write_to_png('%s/%s.png' % (self.path, str(self.i).zfill(3)))
+        self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.width, self.height)
+        self.i += 1
+
+
+class PDFBackend(BaseCairoBackend):
+    def __init__(self, path, width, height):
+        super(PDFBackend, self).__init__(path, width, height)
+        self.surface = cairo.PDFSurface(path, width, height)
+
+    def turn_page(self, content=None, cr=None):
+        cr = cairo.Context(self.surface)
+        cr.show_page()
+
+
+class OverviewBackend(PDFBackend):
+    def __init__(self, path, width, height):
+        super(OverviewBackend, self).__init__(path, width, height)
+        self.surface = cairo.PDFSurface(path, width, width * math.sqrt(2))
+
+    def turn_page(self, content=None, cr=None):
+        if cr is None:
+            cr = cairo.Context(self.surface)
+        if content:
+            cr.move_to(0, self.height)
+            draw_text(cr, content.raw, spacing=0.1, markup=False)
+        cr.show_page()
+
+
+
+def SVG(s):
+    return '{http://www.w3.org/2000/svg}' + s
+
+
+def INK(s):
+    return '{http://www.inkscape.org/namespaces/inkscape}' + s
+
+
+image_cache = {}
+def load_png(fname):
+    if not fname in image_cache:
+    	try:
+        	image_cache[fname] = cairo.ImageSurface.create_from_png(fname)
+        except cairo.Error:
+        	print 'ERROR: could not load %s' % fname
+        	sys.exit(1)
+    return image_cache[fname]
+
+
+def show_img(cr, fname, move=True, center_x=True, center_y=False):
+    if fname.endswith('.png'):
+        img = load_png(fname)
+    elif fname.endswith('.svg'):
+        mtime = str(os.stat(fname))
+        cache = 'cache/%s.png' % hashlib.md5(fname + mtime).hexdigest()
+        if not os.path.exists(cache):
+            os.system(INKSCAPE_CMD + ' -C -e %s %s' % (cache, fname))
+        img = load_png(cache)
+    else:
+        raise AttributeError('only .svg and .png are allowed with #img')
+
+    x, y = cr.get_current_point()
+    if center_x:
+        x = (SLIDE_WIDTH - img.get_width()) /2
+    if center_y:
+        y = (SLIDE_HEIGHT - img.get_height()) /2
+    cr.set_source_surface(img, x, y)
+    cr.rectangle(x, y, img.get_width(), img.get_height())
+    cr.fill()
+
+    if move:
+        cr.move_to(x, y + img.get_height() + BASE_SIZE)
+    else:
+        cr.move_to(x, y)
+
+
+def SVGPart(backend , fname, pn):
+    """SVG source"""
+    cr = cairo.Context(backend.get_surface())
+    if '--skip-svg' in sys.argv:
+        cr.set_source_rgb(1.0, 0.2, 0.2)
+        cr.rectangle(0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
+        cr.fill()
+        cr.move_to(0, 0)
+        draw_text(cr, 'Skipped %s' % fname, color='black')
+        backend.turn_page()
+        return pn + 1
+    svg_et = et.parse(fname)
+    # find all pages
+    pages = []
+    for element in svg_et.getroot().findall(SVG('g')):
+        groupmode = element.get(INK('groupmode'))
+        label = element.get(INK('label'))
+
+        style = element.get('style')
+        if groupmode == 'layer' and PAGE_LABEL.match(label):
+            pages.append((element, label))
+            if not style in (None, 'display:none', 'display:inline'):
+                raise AttributeError('Layer "%s": Unknown style "%s"' % (label, style))
+
+    pages.sort(key=lambda x: x[1])
+    n_last = ''
+    for element, label in pages:
+        # calc page nr
+        n_this = label.split('_', 1)[0]
+        if n_this != n_last:
+            pn += 1
+        n_last = n_this
+        for element2, _ in pages:
+            element2.set('style', 'display:none')
+        element.set('style', '')
+
+        open('tmp.svg', 'w').write(et.tostring(svg_et.getroot()))
+        cache = 'cache/%s_%s_%s.png' % (str(pn).zfill(3), label, fname.replace('/', '_'))
+        if not os.path.exists(cache) \
+          or os.stat(cache).st_mtime < os.stat(fname).st_mtime:
+            os.system(INKSCAPE_CMD + ' -w %i -h %i -C -e %s tmp.svg'
+                                         % (SLIDE_WIDTH, SLIDE_HEIGHT, cache))
+        cr.move_to(0, 0)
+        show_img(cr, cache)
+        backend.turn_page()
+    return pn
+
+
+def word_wrap(cr, text, width_avail):
+    re = []
+    while text != '':
+        words = text.split(' ')
+        width = 301
+        while cr.text_extents(' '.join(words))[2] > width_avail:
+            words = words[:-1]
+
+        re.append(' '.join(words))
+        text = text[len(re[-1])+1:]
+    return re
+
+
+def draw_bg(cr, pn):
+    cache = 'cache/%i.png' % pn
+    if not os.path.exists(cache):
+        tmp_g = genshi.template.MarkupTemplate(open('bg.svg').read())
+        tmp_svg = tmp_g.generate(pn=pn).render()
+        open('tmp.svg', 'w').write(tmp_svg)
+        os.system(INKSCAPE_CMD + ' -w %i -h %i -C -e %s tmp.svg' %
+                                             (SLIDE_WIDTH, SLIDE_HEIGHT, cache))
+
+    cr.move_to(0, 0)
+    show_img(cr, cache)
+    cr.move_to(0, 0)
+
+
+def draw_text(cr, text, size=None, spacing=0.3, color="#000000",
+              center_x=False, center_y=False,
+              move_x=False, move_y=True,
+              markup=True):
+    if not size:
+        size = BASE_SIZE
+    if markup:
+        text = '<span face="%s" font_size="%i" fgcolor="%s">%s</span>' \
+                % (FONT, size*pango.SCALE, color, text, )
+        attrs, text, _ = pango.parse_markup(text)
+    cr.set_source_rgb(*Color(color).to_cairo_rgb())
+    cr_pango = pangocairo.CairoContext(cr)
+    layout = cr_pango.create_layout()
+    if center_x:
+        layout.set_alignment(pango.ALIGN_CENTER)
+
+    layout.set_text(text)
+    if markup:
+        layout.set_attributes(attrs)
+    layout.set_spacing(int(spacing*size*pango.SCALE))
+    pos = cr.get_current_point()
+    layout.set_width(int((SLIDE_WIDTH - MARGIN - pos[0]) * pango.SCALE))
+    w, h = layout.get_pixel_size()
+    if center_y:
+        cr.move_to(pos[0], (SLIDE_HEIGHT - h) / 2 )
+    #else:
+        #cr.rel_move_to(0, -size)
+    cr_pango.show_layout(layout)
+    cr.rel_move_to(w if move_x else 0, h if move_y else 0)
+    return
+
+
+def draw_list_line(cr, data, line_spacing, dot = "•"):
+    """Draw one item of a list"""
+    intend, text = data
+    start_x, start_y = cr.get_current_point()
+    size = BASE_SIZE
+    if intend == 2:
+        size = size * 0.8
+        cr.set_font_size(size * 0.8)
+    elif intend > 2:
+        cr.set_font_size(size * 0.6)
+        size = size * 0.6
+
+    spacing_extra = 30
+    intend_size = 20
+
+    cr.rel_move_to(intend_size*intend, 0)
+    draw_text(cr, dot, size, line_spacing*0.5, move_x=True, move_y=False)
+    cr.rel_move_to(spacing_extra, 0)
+
+    draw_text(cr, text, size, line_spacing*0.5)
+    new_x, new_y = cr.get_current_point()
+    cr.move_to(start_x, new_y + line_spacing*size)
+
+
+def draw_code(cr, data):
+    """Draw code with highlighting on current position"""
+    language, code  = data
+    cache = 'cache/%s.png' % hashlib.sha256(code).hexdigest()
+    if language:
+        language = language[0]
+    else:
+        language = 'python'
+    if not os.path.exists(cache):
+        # TODO try to not spawn a separate process
+        # -> may write a pygmentize cairo backend
+        proc = sp.Popen('pygmentize -l ' + language + ' -O "font_name=Liberation Mono,font_size=20,line_number_bg=#fff" -o %s' % cache, shell=True, stdin=sp.PIPE)
+        proc.stdin.write(code)
+        proc.stdin.close()
+        proc.wait()
+
+    cr.rel_move_to(0, - BASE_SIZE)
+    show_img(cr, cache)
+#    cr.rel_move_to(0, 0)
+
+
+def parse_text(text, sources):
+    re = ''
+    used_sources = set()
+    data = text.split('#')
+    re = data[0]
+    for part in data[1:]:
+        if part == '':
+            re += '#'
+        elif part.startswith('quote'):
+            assert part[5] == '{'
+            assert part.find('}') > 0
+            part_qoutes = [p.strip() for p in part[6:part.find('}')].split(',')]
+            for part_qoute in part_qoutes:
+                if not part_qoute in sources:
+                    sources.append(part_qoute)
+            used_sources.update(part_qoutes)
+            re += '[' + ', '.join(str(sources.index(q)) for q in part_qoutes) + ']'
+    return re, used_sources
+
+
+def _get_from_bibtex(data):
+    re = _bibtex.get_native(data)
+    if re.startswith('{') or re.startswith('"'):
+        re = re[1:-1]
+    return re
+
+
+def show_source(cr, nr, data, size):
+#    print data
+    cr.set_font_size(size)
+    pos = cr.get_current_point()
+    cr.show_text('[%i] ' % nr)
+    author = _get_from_bibtex(data['author'])
+
+    title = _get_from_bibtex(data['title'])
+    draw_text(cr, title, size, 1.1)
+    new_pos = cr.get_current_point()
+    cr.move_to(pos[0], new_pos[1])
+
+
+class Page(list):
+    def __init__(self, source='unknown'):
+        self.source = source
+        self.raw = ''
+        super(Page, self).__init__()
+
+
+class TextPage(Page):
+    def render(self, backend):
+        skipHeader = False
+        do_steps = '--single' not in sys.argv
+        line_spacing = 1.6
+        sources = []
+
+        ### draw
+        cr = cairo.Context(backend.get_surface())
+        write = True
+        used_sources = set()
+        for line in (xrange(len(self)) if do_steps else [len(self) -1]):
+            if write:
+                draw_bg(cr, self.pn)
+
+            cr.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_source_rgb(0.0, 0.0, 0.0)
+            cr.set_font_size(BASE_SIZE *1.2)
+
+
+            if not skipHeader:
+                x = float(config.get('header', 'left'))
+                y = float(config.get('header', 'top'))
+                cr.move_to(x, y)
+                #cr.rel_move_to(0, BASE_SIZE*1.2)
+                draw_text(cr, self.heading, BASE_SIZE*1.2, spacing=1.0)
+                pos = cr.get_current_point()
+
+            cr.move_to(15, 15 + BASE_SIZE*1.2 * 2)
+
+            cr.rel_move_to(MARGIN-10, BASE_SIZE+y)
+
+            cr.set_font_size(BASE_SIZE)
+
+            write = True
+            width_avail = 300
+            done = False
+            size = BASE_SIZE
+
+            for line_nr, d in enumerate(self[:line+1]):
+                type, line_data = d
+                cr.set_font_size(size)
+                if type == 'space':
+                    cr.rel_move_to(0, size)
+                    write = False
+                else:
+                    write = True
+
+                    if line_nr == line or '--single' in sys.argv:
+                        cr.set_source_rgb(0.0, 0.0, 0.0)
+                    else:
+                        cr.set_source_rgb(0.4, 0.4, 0.4)
+                    if type == 'list':
+                        # cr.set_source_rgb(0.0, 0.0, 0.0)
+                        draw_list_line(cr, line_data, 0.4)
+                    elif type == 'code':
+                        draw_code(cr, line_data)
+                    elif type == 'text':
+                        draw_text(cr, line_data, size, line_spacing)
+                    elif type == 'fullscreen':
+                        bg = line_data.get('bg', 'black')
+                        cr.set_source_rgb(*Color(bg).to_cairo_rgb())
+                        cr.rectangle(0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
+                        cr.fill()
+                        cr.move_to(0,0)
+                        show_img(cr, line_data['src'], True, center_x=True, center_y=True)
+                    elif type == 'img':
+                        if ' ' in line_data:
+                            text, move = line_data.split(' ')
+                            move = move.lower() == 'true'
+                        else:
+                            text, move = line_data, True
+                        show_img(cr, text, move)
+                    elif type == '!':
+                        exec(line_data)
+                    elif type == 'used_sources':
+                        print used_sources, line_data
+                        used_sources.update(line_data)
+                        write = False
+                    else:
+                        print 'unkown type', type
+            if write or not do_steps:
+                # show sources
+                for source in used_sources:
+                    show_source(cr, sources.index(source), bib[source], size * .7)
+                used_sources = set()
+                if cr.get_current_point()[1] - size > SLIDE_HEIGHT:
+                    print 'WARNING: slide %i "%s" is overfull (from %s)' % (self.pn, self.heading, self.source)
+                backend.turn_page(cr=cr, content=self)
+                cr = cairo.Context(backend.get_surface())
+
+
+class SingleWord(Page):
+    style="dark"
+
+    def render(self, backend):
+        cr = cairo.Context(backend.get_surface())
+        cr.set_font_size(BASE_SIZE * 1.5)
+        cr.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        current = []
+        for line in self:
+            if self.style == "dark":
+                cr.set_source_rgb(0, 0, 0)
+            else:
+                cr.set_source_rgb(1, 1, 1)
+            cr.rectangle(0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
+            cr.fill()
+            if self.style == "dark":
+                color = '#ffffff'
+            else:
+                color = '#000000'
+            if line[0] == 'text':
+                text = line[1]
+                draw_text(cr, text, color=color, center_x=True, center_y=True)
+                #xbearing, ybearing, width, height, xadvance, yadvance = cr.text_extents(text)
+                #pos_x = (SLIDE_WIDTH - width) / 2
+                #pos_y = (SLIDE_HEIGHT) / 2
+                #cr.move_to(pos_x, pos_y)
+                #cr.show_text(text)
+                backend.turn_page(cr=cr, content=self)
+                current = []
+            elif line[0] == 'list':
+                this_text = line[1][1]
+                base_y = (SLIDE_HEIGHT - BASE_SIZE * 1.6 * (len(current)-1)) / 2
+                text = ''
+                if current:
+                    text = '<span color="#b3b3b3">' + '\n'.join(current) + '</span>\n'
+                text += '<span color="' + color + '">' + this_text + '</span>'
+                draw_text(cr, text, color=color, center_x=True, center_y=True)
+                backend.turn_page(cr=cr, content=self)
+                current.append(this_text)
+            else:
+                print 'wtf', line
+
+
+class ImageShow(Page):
+    def render(self, backend):
+        pass
+
+
+class Code(object):
+    def __init__(self):
+        self.code = ''
+
+
+PAGE_TYPES = {'default': TextPage,
+              'single_word': SingleWord,
+              'image_show': ImageShow}
+
+
+class TextParser(object):
+    def __init__(self, src, pn):
+        self.source = repr(src)
+        self.src = src
+        self.pn = pn
+        self.pages = []
+        self.type = 'default'
+        self.new_page()
+        self.parse_default()
+
+    def parse(self):
+        pass
+
+    def parse_default(self):
+        do_steps = '--single' not in sys.argv
+        line_spacing = 1.6
+        sources = []
+        for line in self.src:
+            s_line = line.lstrip()
+
+
+            if line.startswith('#code'):
+                self.prase_code()
+
+            if s_line.startswith('---') or s_line.startswith('___'):
+                self.new_page(s_line)
+                continue
+
+            self.page.raw += line
+            if s_line.startswith('#!'):
+                self.page.append(['!', s_line[2:].strip()])
+            elif s_line.startswith('#fullscreen'):
+                args = s_line[11:].strip().split(' ', 1)
+                data = {'src': args[0]}
+                if len(args) > 1:
+                    data.update(self.parse_arguments(args[1]))
+                self.page.append(['fullscreen', data])
+            elif s_line.startswith('#img'):
+                self.page.append(['img', s_line[4:].strip()])
+            elif s_line.startswith('*'):
+                text = s_line[1:].strip()
+                text, used_sources = parse_text(text, sources)
+                if used_sources:
+                    self.page.append(('used_sources', used_sources))
+                self.page.append(('list', (len(line) - len(s_line), text)))
+
+                #data.append(['code', [line.split(' ')[1:], '']])
+            elif line.startswith('#pagenumber'):
+                if line.endswith('++'):
+                    self.pn += 1
+                elif line.endswith('--'):
+                    self.pn -= 1
+            elif line.startswith('#skipheader'):
+                skipHeader = True
+            elif s_line.startswith('#'):
+                pass
+
+            elif s_line != '':
+                self.page.append(('text', line.rstrip()))
+            else:
+                if self.page:
+                    self.page.append(('space', None))
+
+    def parse_code(self):
+        code = Code()
+        for line in self.src:
+            if line == '#end_code':
+                self.page.append(code)
+                return
+            else:
+                code.code += line
+
+    def new_page(self, line=''):
+        heading = self.src.next().rstrip()
+        arguments = {}
+        while heading.startswith('---') or heading.startswith('___'):
+            arguments.update(self.parse_arguments(line))
+            line = heading
+            heading = self.src.next().rstrip()
+        arguments.update(self.parse_arguments(line))
+        self.pn += 1
+        if 'type' in arguments:
+            self.type = arguments['type']
+        self.page = PAGE_TYPES[self.type](source=self.source)
+        self.page.heading = heading
+        self.page.pn = self.pn
+        self.pages.append(self.page)
+        for key, value in arguments.items():
+            setattr(self.page, key, value)
+
+    def parse_arguments(self, line):
+        arguments = {}
+        line = line.lstrip('-_ \t')
+        for args in line.split(' '):
+            if args and '=' in args:
+                key, value = args.split('=')
+                arguments[key] = value
+        return arguments
+
+
+def TextPart(backend, fname, pn):
+    """Plain text source"""
+    tp = TextParser(open(fname), pn)
+    tp.source = fname
+    tp.parse()
+
+    pages = tp.pages
+    for page in pages:
+        page.render(backend)
+    return tp.pn
+
+
+def PngPart(backend, fname, pn):
+    cr = cairo.Context(backend.get_surface())
+    cr.set_source_rgb(0, 0, 0)
+    cr.rectangle(0, 0, SLIDE_WIDTH, SLIDE_HEIGHT)
+    cr.fill()
+
+    img = load_png(fname)
+    x = (SLIDE_WIDTH-img.get_width()) /2
+    y = (SLIDE_HEIGHT-img.get_height()) /2
+    cr.set_source_surface(img, x, y)
+    cr.rectangle(x, y, img.get_width(), img.get_height())
+    cr.fill()
+
+    backend.turn_page()
+    return pn + 1
+
+
+def main():
+    global config
+    global BASE_SIZE, MARGIN, SLIDE_WIDTH, SLIDE_HEIGHT, FONT
+    global bib
+    if os.path.exists('build'):
+        shutil.rmtree('build')
+    os.mkdir('build')
+
+    if not os.path.exists('cache'):
+        os.mkdir('cache')
+
+    # read config
+    # New instance with 'bar' and 'baz' defaulting to 'Life' and 'hard' each
+    config = ConfigParser.SafeConfigParser({'bar': 'Life', 'baz': 'hard'})
+
+    cfg_files = [DATA_PATH + '/toertchen.cfg']
+    config.readfp(open(cfg_files[0]))
+    cfg_files.extend(config.read('toertchen.cfg'))
+    print 'Used config files', repr(cfg_files)
+
+    BASE_SIZE = int(config.get('layout', 'size'))
+    MARGIN = int(config.get('layout', 'margin'))
+    FONT = config.get('layout', 'font').strip()
+    SLIDE_WIDTH = int(config.get('slide', 'width'))
+    SLIDE_HEIGHT = int(config.get('slide', 'height'))
+
+    # 1 point == 1/72.0 inch
+    pn = 0
+    backend = PDFBackend('output.pdf', SLIDE_WIDTH, SLIDE_HEIGHT)
+    #backend = OverviewBackend('output.pdf', SLIDE_WIDTH, SLIDE_HEIGHT)
+#    backend = PNGBackend('output/', SLIDE_WIDTH, SLIDE_HEIGHT)
+
+    bib = {}
+    bib_src = [fname for fname in os.listdir('.') if fname.endswith('.bib')]
+    if _bibtex:
+        for fname in bib_src:
+            handle = _bibtex.open_file(fname, 0)
+            data = _bibtex.next(handle)
+            while data:
+                content = data[4]
+                content['type'] = data[1]
+                bib[data[0]] = content
+                data = _bibtex.next(handle)
+    elif bib_src:
+        print 'WARNING: could not parse bibtex sources, python-bibtex is not installed'
+
+
+    for fname in sorted(os.listdir('src')):
+        if fname.startswith('.'):
+            continue
+        fname = 'src/' + fname
+        if fname.endswith('~') or os.path.isdir(fname):
+            continue
+        print 'Source: ' + fname
+        if fname.endswith('.svg'):
+            pn = SVGPart(backend, fname, pn)
+        elif fname.endswith('.png'):
+        	pn = PngPart(backend, fname, pn)
+        else:
+            pn = TextPart(backend, fname, pn)
+        print
+    print 'output.pdf (%i slides)' % pn
+
+
+if __name__ == '__main__':
+    main()
+

@@ -1,0 +1,19 @@
+Page Heading
+
+* First bullet point
+ * Sub point
+ * Another point
+
+---
+Second Slide
+
+Some text with no meaning...
+
+* more text...
+
+---
+Onther Slide
+
+ * [I]f you were coming from Mars and tried to re-implement Python from this document alone, you might have to guess things and in fact you would probably end up implementing quite a diﬀerent language. #quote{van2003python}
+ * The complete syntax of BibTEX [...] #quote{visser1997syntax}
+ * Quting two sources is possible to! #quote{van2003python, visser1997syntax}
